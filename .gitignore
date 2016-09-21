@@ -1,0 +1,11 @@
+*.o
+.tags
+*.gcov
+*.gcno
+*.gcda
+api/tests
+daemon/daemon
+devices/common/tests
+devices/gui/
+logger/logger
+snapshot/snapshot

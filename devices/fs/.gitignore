@@ -1,0 +1,4 @@
+*.o
+*.so
+fsserver
+fsclient

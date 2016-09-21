@@ -1,0 +1,10 @@
+{
+	"name": "test",
+	"color": "white",
+
+	"filesystem": {
+		"/tmp/cappsule-testfs/rw/**": "rw",
+		"/tmp/cappsule-testfs/r/**": "r",
+		"/tmp/cappsule-testfs/w/**": "w",
+	}
+}

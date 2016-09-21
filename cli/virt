@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+# -*- Mode: Python; tab-width: 8; indent-tabs-mode: t; -*-
+
+from argparse import ArgumentParser, REMAINDER
+import os
+import sys
+import socket
+import json
+import multiprocessing
+from multiprocessing.pool import ThreadPool
+import pwd, grp
+import struct
+import fcntl
+import termios
+import array
+import readline
+import tty
+import pty
+import select
+import signal
+import errno
+
+class CappsuleClientError(Exception):
+	pass
+
+class CappsuleClient:
+	SOCKET_API_NAME = "cappsule_api"
+
+	def _connect(self, socket_name):
+		self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		try:
+			self.sock.connect("\x00" + socket_name)
+		except ConnectionRefusedError as err:
+			raise CappsuleClientError("cannot connect to cappsule server")
+
+	def _recv_packet(self):
+		io = self.sock.makefile()
+		try:
+			packet_size = io.readline(10).rstrip()
+
+			if packet_size is None or len(packet_size) < 1:
+				raise CappsuleClientError("cannot read packet size")
+			if any(not c.isdigit() for c in packet_size):
+				raise CappsuleClientError("invalid packet size received")
+			packet_size = int(packet_size)
+
+			packet = io.read(packet_size)
+			if packet is None or len(packet) != packet_size:
+				raise CappsuleClientError("received truncated packet")
+		finally:
+			io.close()
+
+		return json.loads(packet)
+
+	def _send_packet(self, obj):
+		data = json.dumps(obj)
+		packet = bytes("{}\n{}\n".format(len(data)+1, data), "UTF-8")
+		return self.sock.sendall(packet)
+
+	def _query(self, obj):
+		self._send_packet(obj)
+		return self._recv_packet()
+
+	def __init__(self):
+		self._connect(self.SOCKET_API_NAME)
+
+	def get_capsule_stats(self, capsule_id):
+		resp = self._query({'cmd': "get_stats", 'id': capsule_id})
+		if resp['success'] != True:
+			raise CappsuleClientError("couldn't get statistics for capsule {}: {}".format(capsule_id, resp['error']))
+		return resp['result']
+
+	def get_info(self, capsule_id, kind="*"):
+		resp = self._query({'cmd': "get_info", 'id': capsule_id, 'type': kind})
+		if resp['success'] != True:
+			raise CappsuleClientError("couldn't get information for capsule {}: {}".format(capsule_id, resp['error']))
+		return resp['result']
+
+	def get_vmm_stats(self, cpu):
+		resp = self._query({'cmd': "get_vmm_stats", 'cpu': cpu})
+		if resp['success'] != True:
+			raise CappsuleClientError("couldn't get statistics for CPU {} of VMM: {}".format(cpu, resp['error']))
+		return resp['result']
+
+	def get_policies(self):
+		resp = self._query({'cmd': "get_policies"})
+		if resp['success'] != True:
+			raise CappsuleClientError("couldn't get list of policies: {}".format(resp['error']))
+		return resp['result']['policies']
+
+	def reload_policies(self):
+		resp = self._query({'cmd': "update_policies"})
+		if resp['success'] != True:
+			raise CappsuleClientError("couldn't reload policies: {}".format(resp['error']))
+		return resp['result']['policies']
+
+	def running_capsules(self):
+		resp = self._query({'cmd': "get_capsule_ids"})
+		if resp['success'] != True:
+			raise CappsuleClientError("couldn't get list of running capsules: {}".format(resp['error']))
+		return resp['result']['capsule_ids']
+
+	def create_capsule(self, params):
+		resp = self._query({'cmd': "create", 'params': params})
+		if resp['success'] != True:
+			raise CappsuleClientError("failed to launch capsule: {}".format(resp['error']))
+
+		capsule_id = resp['result']['capsule_id']
+		return capsule_id
+
+	def wait_for_exit(self, capsule_id):
+		resp = self._query({'cmd': "listen_events", 'id': capsule_id})
+		if resp['success'] != True:
+			raise CappsuleClientError("cannot listen for events: {}".format(resp['error']))
+		while True:
+			msg = self._recv_packet()
+			if 'event' in msg and msg['event'] == 'exit' and msg['capsule_id'] == capsule_id:
+				exit_reason = msg['reason']
+				return (capsule_id, exit_reason)
+
+	def kill_capsule(self, capsule_id):
+		resp = self._query({'cmd': "kill", 'id': capsule_id})
+		if resp['success'] != True:
+			raise CappsuleClientError("failed to kill capsule: {}".format(resp['error']))
+		return True
+
+class CappsuleCLIError(Exception):
+	pass
+
+class CappsuleArgumentParser(ArgumentParser):
+	def error(self, message):
+		raise CappsuleCLIError(message)
+
+class CappsuleCLI:
+	VERSION = "0.x.x-dev"
+	DISPLAY_ENV_FILE = "/run/cappsule/display"
+	CONSOLE_SERVER_SOCKET = "cappsule_console"
+	FSTYPES = [ 'overlay','aufs','direct' ]
+
+	def shell_handler(name, require_daemon=True):
+		def _wrapper(handler):
+			def wrapper(self, args):
+				parser = self.commands[name][2]
+				args = parser.parse_args(args)
+				if require_daemon:
+					self._create_client()
+				return handler(self, args)
+			return wrapper
+		return _wrapper
+
+	def _show_commands(self):
+		print("Available commands:")
+		for cmd in sorted(self.commands):
+			print("    {:<9} {:<12}".format(cmd + ':', self.commands[cmd][0]))
+
+	def _tty_get_size(self, fd):
+		rows, cols = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ, "\x00" * 4))
+		return (rows, cols)
+
+	def _tty_set_size(self, fd, rows, cols):
+		fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("hhhh", rows, cols, 0, 0))
+
+	def _tty_get_attr(self, io):
+		if io.isatty():
+			return termios.tcgetattr(io.fileno())
+		else:
+			return None
+
+	def _tty_set_attr(self, io, attr):
+		if io.isatty():
+			termios.tcsetattr(io.fileno(), termios.TCSANOW, attr)
+
+	def _recv_console_pts(self, capsule_id):
+		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		try:
+			socket_path = "\x00" + self.CONSOLE_SERVER_SOCKET + ":%d" % capsule_id
+			sock.connect(socket_path)
+		except ConnectionRefusedError as err:
+			raise CappsuleCLIError("Cannot connect to console server for capsule {}".format(capsule_id))
+
+		fds = array.array('i')
+		try:
+			msg, ancdata, flags, addr = sock.recvmsg(1, socket.CMSG_LEN(fds.itemsize))
+			for cmsg_level, cmsg_type, cmsg_data in ancdata:
+				if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
+					fds.fromstring(cmsg_data[:len(cmsg_data) - (len(cmsg_data) % fds.itemsize)])
+		finally:
+			sock.close()
+
+		if len(fds) != 1:
+			raise CappsuleCLIError("No pts received from console server")
+		return fds[0]
+
+
+
+	def _console_bridge(self, stdin, stdout, stderr, pts):
+		# Save tty states and switch to raw.
+		tty_state = dict([ (c.fileno(), self._tty_get_attr(c)) for c in (stdin, stdout, stderr) ])
+		for c in (stdin, stdout, stderr):
+			if c.isatty():
+				tty.setraw(c)
+		# Set pts size.
+		signal.signal(signal.SIGWINCH, self._handle_window_resize)
+		self._handle_window_resize(None, None)
+		try:
+			rlist = [ stdin.fileno(), pts ]
+			while rlist:
+				try:
+					readable, _, _ = select.select(rlist, [], [], 0.1)
+					for fd in readable:
+						if fd == stdin.fileno():
+							outfd = pts
+						elif fd == pts:
+							outfd = stdout.fileno()
+						data = os.read(fd, 1024)
+						if len(data) > 0:
+							os.write(outfd, data)
+						elif fd == pts:
+							# console closed
+							return
+						else:
+							# stdin closed
+							rlist.remove(fd)
+				except IOError as e:
+					if e.errno != errno.EINTR:
+						break
+
+		# Restore tty states on exit.
+		finally:
+			signal.signal(signal.SIGWINCH, signal.SIG_IGN)
+			for c in (stdin, stdout, stderr):
+				self._tty_set_attr(c, tty_state[c.fileno()])
+
+	def _handle_window_resize(self, _signum, _frame):
+		if self.pts is not None:
+			for c in (sys.stdin, sys.stdout, sys.stderr):
+				if c.isatty():
+					rows, cols = self._tty_get_size(c.fileno())
+					self._tty_set_size(self.pts, rows, cols)
+					break
+
+	def _filter_env(self, env, no_gui):
+		env = [ var for var in env if not any(var.startswith(v) for v in ('DISPLAY', 'DBUS_SESSION_BUS_ADDRESS', 'SESSION_MANAGER')) ]
+		if not no_gui:
+			with open(self.DISPLAY_ENV_FILE) as fp:
+				display = int(fp.read())
+			env.append("DISPLAY=:{}".format(display))
+		return env
+
+	def usage(self):
+		print("Usage: {0} COMMAND <OPTIONS>".format(__file__))
+		self._show_commands()
+
+	def run(self, command, args):
+		if command in self.commands:
+			self.commands[command][1](args)
+		else:
+			print("Command not found: {}".format(command), file=sys.stderr)
+
+	@shell_handler('help', require_daemon=False)
+	def cmd_help(self, args):
+		if args.command[0] not in self.commands:
+			print("Unknown command '{}'".format(command))
+			self._show_commands()
+		else:
+			self.commands[args.command[0]][2].print_help()
+
+	@shell_handler('attach')
+	def cmd_attach(self, args):
+		try:
+			capsule_id = args.capsule_id[0]
+			pool = ThreadPool(processes=1)
+			exit_result = pool.apply_async(self.client.wait_for_exit, (capsule_id,))
+			self.pts = self._recv_console_pts(capsule_id)
+			self._console_bridge(sys.stdin, sys.stdout, sys.stderr, self.pts)
+			_, exit_reason = exit_result.get()
+		finally:
+			if not self.pts is None:
+				os.close(self.pts)
+				self.pts = None
+
+		if exit_reason is not None and len(exit_reason) > 0:
+			print("capsule {} exited (reason: {}).".format(capsule_id, exit_reason), file=sys.stderr)
+
+	@shell_handler('exec')
+	def cmd_exec(self, args):
+		if len(args.target) < 1:
+			print("No target specified for {} exec".format(sys.argv[0]), file=sys.stderr)
+			return
+		try:
+			cwd = os.getcwd()
+		except FileNotFoundError:
+			cwd = '/'
+
+		policy = args.policy
+		if not policy:
+			policy = os.path.basename(args.target[0])
+
+		if '/' in policy:
+			print('Invalid policy "{}"'.format(policy))
+			return
+
+		miscfs = []
+		if args.miscfs:
+			for fs in args.miscfs:
+				if ':' in fs:
+					path, fstype = fs.rsplit(':', 1)
+					if fstype not in self.FSTYPES:
+						raise CappsuleClientError('raise invalid type "{}" for fs "{}"'.format(fstype, path))
+				else:
+					path, fstype = fs, 'overlay'
+				miscfs.append(path)
+				miscfs.append(fstype)
+
+		if args.basedir == '' and args.fstype in [ 'overlay', 'aufs' ]:
+			#  /home/user/.cappsule/unrestricted/
+			home = pwd.getpwuid(os.getuid()).pw_dir
+			basedir = os.path.join(home, '.cappsule/', policy)
+		else:
+			basedir = args.basedir
+
+		if basedir and not os.path.exists(basedir):
+			try:
+				os.makedirs(basedir, 0o700)
+			except:
+				raise CappsuleClientError('cannot create base directory "{}"'.format(basedir))
+
+		if not args.no_gui:
+			display = os.getenv('DISPLAY')
+			if display is None:
+				raise CappsuleClientError("DISPLAY environment variable isn't set")
+		else:
+			display = ''
+
+		params = {
+			'policy': policy,
+			'argv': args.target,
+			'env': self._filter_env([ '%s=%s' % (k, v) for (k, v) in os.environ.items() ], args.no_gui),
+			'no-gui': args.no_gui,
+			'display': display,
+			'rootfs': args.rootfs,
+			'fstype': args.fstype,
+			'miscfs': miscfs,
+			'basedir': basedir,
+			'cwd': cwd,
+			'groups': ','.join([ '%u' % gid for gid in os.getgroups() ]),
+			'memory': int(args.memory),
+		}
+
+		# Get the tty size from the first available tty.
+		for io in (sys.stdin, sys.stdout, sys.stderr):
+			if io.isatty():
+				rows, cols = self._tty_get_size(io.fileno())
+				# ensure sizes aren't zero
+				rows = max(1, rows)
+				cols = max(1, cols)
+				params['tty'] = "{}x{}".format(rows, cols)
+				break
+
+		try:
+			capsule_id = self.client.create_capsule(params)
+			if args.detached:
+				print("Created capsule {}".format(capsule_id))
+				return
+
+			pool = ThreadPool(processes=1)
+			exit_result = pool.apply_async(self.client.wait_for_exit, (capsule_id,))
+			self.pts = self._recv_console_pts(capsule_id)
+			self._console_bridge(sys.stdin, sys.stdout, sys.stderr, self.pts)
+			_, exit_reason = exit_result.get()
+
+		finally:
+			if self.pts is not None:
+				os.close(self.pts)
+				self.pts = None
+
+		if exit_reason is not None and len(exit_reason) > 0:
+			print("capsule {} exited (reason: {}).".format(capsule_id, exit_reason), file=sys.stderr)
+
+	@shell_handler('info')
+	def cmd_info(self, args):
+		for i in args.capsule_id:
+			infos = self.client.get_info(i)
+			rootfs, creds = infos['rootfs'], infos['creds']
+			uid, gid = creds['uid'], creds['gid']
+			cmdline = ' '.join(infos['argv'])
+			print("Capsule #{} configuration:".format(i))
+			print("  Command: {}".format(cmdline))
+			print("  Pid: {}".format(creds['pid']))
+			print("  Root filesystem:")
+			print("    Type: {}".format(rootfs['type']))
+			print("    Path: {}".format(rootfs['path']))
+			print("  Policy uuid: {}".format(creds['policy_uuid']))
+			print("  Uid: {}({})".format(uid, pwd.getpwuid(uid).pw_name))
+			print("  Gid: {}({})".format(gid, grp.getgrgid(gid).gr_name))
+
+	@shell_handler('kill')
+	def cmd_kill(self, args):
+		for i in args.capsule_id:
+			self.client.kill_capsule(i)
+
+	@shell_handler('stats')
+	def cmd_capsule_stats(self, args):
+		for i in args.capsule_id:
+			stats = self.client.get_capsule_stats(i)
+			print("Statistics for capsule #{}:".format(i))
+			print("  Total CPU time: {} ns".format(stats['total_time']))
+			print("  Context switches: {}".format(stats['context_switches']))
+			print("  Injected interrupts:")
+			print("     Local timer: {}".format(stats['interrupts']['local_timer']))
+			print("     xchan:       {}".format(stats['interrupts']['xchan']))
+			print("  Hypercalls:")
+			for hc in sorted(stats['vmcalls']):
+				event = stats['vmcalls'][hc]
+				if event['count'] > 0:
+					print("    {:<22}: {} calls, {} ns (avg {} ns/call)".format(hc,
+						event['count'],
+						event['elapsed_time'],
+						round(event['elapsed_time'] / event['count'], 2)))
+				else:
+					print("    {:<22}: no calls".format(hc))
+			print("  VM-exits:")
+			for vmexit in sorted(stats['vmexits']):
+				event = stats['vmexits'][vmexit]
+				if event['count'] == 0:
+					continue
+				avg = round(event['elapsed_time'] / event['count'], 2)
+				args = (vmexit, event['count'], event['elapsed_time'], avg)
+				print("    {:<22}: {} calls, {} ns (avg {} ns/call)".format(*args))
+
+	@shell_handler('vmm_stats')
+	def cmd_vmm_stats(self, args):
+		for cpu in range(0, multiprocessing.cpu_count()):
+			stats = self.client.get_vmm_stats(cpu)
+			print("Statistics for CPU #{}:".format(cpu))
+			event = stats['xchan_guest_notif']
+			if event['count'] != 0:
+					avg = round(event['elapsed_time'] / event['count'], 2)
+			else:
+					avg = 0
+			args = (event['count'], event['elapsed_time'], avg)
+			print("  xchan notifs to guest: {} calls, {} ns (avg {} ns/call)".format(*args))
+			print("  VM-exits:")
+			for vmexit in sorted(stats['vmexits']):
+				event = stats['vmexits'][vmexit]
+				if event['count'] == 0:
+					continue
+				avg = round(event['elapsed_time'] / event['count'], 2)
+				args = (vmexit, event['count'], event['elapsed_time'], avg)
+				print("    {:<22}: {} calls, {} ns (avg {} ns/call)".format(*args))
+
+	@shell_handler('policies')
+	def cmd_policies(self, args):
+		if args.reload == True:
+			policies = self.client.reload_policies()
+		else:
+			policies = self.client.get_policies()
+
+		print("Policy name                UUID")
+		print("-----------                ----")
+		for policy in policies:
+			print("{:<26} {}".format(policy['name'], policy['uuid']))
+
+	@shell_handler('ps')
+	def cmd_ps(self, _):
+		capsule_ids = self.client.running_capsules()
+		if len(capsule_ids) == 0:
+			print("No capsule running.")
+			return
+
+		policies = self.client.get_policies()
+		print("{:8}  {:<8} {:<8} {:<24} {}".format("ID", "USER", "PID", "POLICY", "COMMAND"))
+		for capsule_id in sorted(capsule_ids):
+			infos = self.client.get_info(capsule_id)
+			creds = infos['creds']
+			user = pwd.getpwuid(creds['uid']).pw_name
+			policy = [ p['name'] for p in policies if p['uuid'] == creds['policy_uuid'] ][0]
+			cmdline = ' '.join(infos['argv'])
+			print("#{:<8} {:<8} {:<8} {:24} {}".format(capsule_id, user, creds['pid'], policy, cmdline))
+
+	@shell_handler('version', require_daemon=False)
+	def cmd_version(self, _):
+		print(self.VERSION)
+
+	def _shell_complete(self, text, state):
+		results = [ c for c in self.commands if c.startswith(text) ] + [ None ]
+		return results[state]
+
+	@shell_handler('shell', require_daemon=False)
+	def cmd_shell(self, _):
+		print("[Capsule shell]", file=sys.stderr)
+		readline.parse_and_bind('tab: complete')
+		readline.set_completer(self._shell_complete)
+		self._show_commands()
+		while True:
+			try:
+				line = input(">>> ").split(' ')
+			except (EOFError, KeyboardInterrupt):
+				return
+
+			if len(line) == 0 or len(line[0]) == 0:
+				continue
+
+			command = line[0]
+			args = line[1:]
+			if command == 'quit' or command == 'exit':
+				return
+
+			try:
+				self.run(command, args)
+			except CappsuleClientError as err:
+				print("[Error] {}.".format(err), file=sys.stderr)
+			except CappsuleCLIError as err:
+				print("Command error: {}.".format(err), file=sys.stderr)
+
+	def _create_client(self):
+		if self.client is None:
+			self.client = CappsuleClient()
+
+	def _create_commands(self):
+		help_parser = CappsuleArgumentParser(prog='{} help'.format(sys.argv[0]), description="Display information about a specific command.")
+		help_parser.add_argument('command', nargs=1)
+
+		attach_parser = CappsuleArgumentParser(prog='{} attach'.format(sys.argv[0]), description="Attach to the TTY of an already running capsule.")
+		attach_parser.add_argument('capsule_id', type=int, nargs=1)
+
+		exec_parser = CappsuleArgumentParser(prog='{} exec'.format(sys.argv[0]), description="Execute a new encapsulated process.")
+		exec_parser.add_argument('-d', '--basedir', action='store', default='', help="Directory of the filesystem modifications made by the capsule")
+		exec_parser.add_argument('-f', '--miscfs', action='append', default=[], help="Additional filesystems")
+		exec_parser.add_argument('-m', '--memory', action='store', default=1024, help="Maximum memory in MB")
+		exec_parser.add_argument('-n', '--no-gui', action='store_true', default=False, help="Disable graphical interface")
+		exec_parser.add_argument('-p', '--policy', action='store', help="Specify policy for capsule")
+		exec_parser.add_argument('-r', '--rootfs', action='store', default='/', help="Root filesystem used by the capsule")
+		exec_parser.add_argument('-t', '--fstype', action='store', choices=self.FSTYPES, default='overlay', help="Root filesystem type")
+		exec_parser.add_argument('-D', '--detached', action='store_true', default=False, help="Run capsule in detached tty mode")
+		exec_parser.add_argument('target', nargs=REMAINDER)
+
+		info_parser = CappsuleArgumentParser(prog='{} info'.format(sys.argv[0]), description="Display information about a capsule.")
+		info_parser.add_argument('capsule_id', type=int, nargs='+')
+
+		kill_parser = CappsuleArgumentParser(prog='{} kill'.format(sys.argv[0]), description="Kill running capsule.")
+		kill_parser.add_argument('capsule_id', type=int, nargs='+')
+
+		policies_parser = CappsuleArgumentParser(prog='{} version'.format(sys.argv[0]), description="List loaded security policies.")
+		policies_parser.add_argument('-r', '--reload', action='store_true', default=False, help="Reload security policies")
+
+		ps_parser = CappsuleArgumentParser(prog='{} ps'.format(sys.argv[0]), description="List running capsules.")
+
+		shell_parser = CappsuleArgumentParser(prog='{} shell'.format(sys.argv[0]), description="Run an interactive shell for commands.")
+
+		capsule_stats_parser = CappsuleArgumentParser(prog='{} vmm_stats'.format(sys.argv[0]), description="Display capsule statistics.")
+		capsule_stats_parser.add_argument('capsule_id', type=int, nargs='+')
+
+		vmm_stats_parser = CappsuleArgumentParser(prog='{} capsule_stats'.format(sys.argv[0]), description="Display VMM statistics.")
+
+		version_parser = CappsuleArgumentParser(prog='{} version'.format(sys.argv[0]), description="Display cappsule version.")
+
+		self.commands = {
+			"help": 	[ "command helper", 			self.cmd_help,		help_parser ],
+			"attach":	[ "attach to a running capsule tty",	self.cmd_attach,	attach_parser ],
+			"exec": 	[ "execute an encapsulated process", 	self.cmd_exec,		exec_parser ],
+			"info": 	[ "print capsule information", 		self.cmd_info,		info_parser ],
+			"kill":		[ "kill capsule",			self.cmd_kill,		kill_parser ],
+			"policies": 	[ "list loaded policies",		self.cmd_policies, 	policies_parser ],
+			"ps": 		[ "list running capsules",		self.cmd_ps, 		ps_parser ],
+			"shell": 	[ "interactive mode", 			self.cmd_shell,		shell_parser ],
+			"stats": 	[ "print capsule statistics", 		self.cmd_capsule_stats,	capsule_stats_parser ],
+			"vmm_stats":	[ "print vmm statistics", 		self.cmd_vmm_stats,	vmm_stats_parser ],
+			"version" : 	[ "print capsule version", 		self.cmd_version, 	version_parser ],
+		}
+
+	def _reopen_std_streams(self):
+		'''If any standard stream is closed, redirect it to /dev/null.'''
+
+		streams = [ ('stdin', 'r'), ('stdout', 'w'), ('stderr', 'w') ]
+		for stream, mode in streams:
+			if getattr(sys, stream) is None:
+				fd = open(os.devnull, mode)
+				setattr(sys, stream, fd)
+
+	def __init__(self):
+		self._reopen_std_streams()
+		self._create_commands()
+		self.client = None
+		self.pts = None
+
+if __name__ == '__main__':
+	cli = CappsuleCLI()
+	if len(sys.argv) < 2:
+		cli.usage()
+		exit(-1)
+
+	command = sys.argv[1]
+	args = sys.argv[2:]
+
+	try:
+		cli.run(command, args)
+	except CappsuleClientError as err:
+		print("Client error: {}.".format(err), file=sys.stderr)
+	except CappsuleCLIError as err:
+		print("Command error: {}.".format(err), file=sys.stderr)
+
+# vim: noet:ts=8:
