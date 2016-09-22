@@ -20,7 +20,7 @@ fsclient.o: fsclient.c
 	$(CC) -o $@ -c $< $(CFLAGS_FUSE)
 
 fsserver: aufs.o direct.o fsserver.o fsserver_op.o mount_handler.o overlay.o ../common/child.o ../common/infos.o ../common/ring.o ../common/xchan.o ../../common/error.o ../../common/filesystem.o ../../common/json.o ../../common/log.o ../../common/policy.o ../../common/readall.o ../../common/utils.o ../../common/uuid.o
-	$(CC) -o $@ $^ $(LDFLAGS) $(shell pkg-config --libs json-c)
+	$(CC) -o $@ $^ -pie $(LDFLAGS) $(shell pkg-config --libs json-c)
 
 mount_override.so: mount_override.o
 	$(CC) -o $@ $^ -ldl $(LDFLAGS) -fPIC -shared

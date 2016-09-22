@@ -33,9 +33,11 @@ USERLAND_MACROS += -DGIT_VERSION=\"$(GIT_VERSION)\"
 # compilation flags
 ################################################################################
 
+CFLAGS_HARDENING := -fstack-protector -Wformat -Wformat-security -D_FORTIFY_SOURCE=2 -fPIE
+LDFLAGS_HARDENING := -Wl,-z,relro,-z,now
 CUAPI_INCLUDE_PATH := $(mkfile_dir)/../hv/include
-CFLAGS := -W -Wall -Wextra -Wfatal-errors -O3 $(USERLAND_MACROS)
-LDFLAGS :=
+CFLAGS := -W -Wall -Wextra -Wfatal-errors -O3 $(CFLAGS_HARDENING) $(USERLAND_MACROS)
+LDFLAGS := $(LDFLAGS_HARDENING)
 STRIP := strip
 
 ifeq ($(COVERAGE),1)

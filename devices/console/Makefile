@@ -1,7 +1,7 @@
 include ../../Makefile.inc
 
 CFLAGS += -I$(CUAPI_INCLUDE_PATH) -I../../include/
-LDFLAGS += $(shell pkg-config --libs json-c) -lrt -lcrypto -lutil
+LDFLAGS += -pie $(shell pkg-config --libs json-c) -lrt -lcrypto -lutil
 EXEC := consoleserver
 
 .PHONY: strip

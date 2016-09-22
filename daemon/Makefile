@@ -1,7 +1,7 @@
 include ../Makefile.inc
 
 CFLAGS += -I../include -I$(CUAPI_INCLUDE_PATH)
-LDFLAGS_DAEMON := $(LDFLAGS) $(shell pkg-config --libs json-c) -lcrypto
+LDFLAGS_DAEMON := -pie $(LDFLAGS) $(shell pkg-config --libs json-c) -lcrypto
 LDFLAGS_TESTS := $(LDFLAGS) -lcmocka
 TARGETS := daemon
 

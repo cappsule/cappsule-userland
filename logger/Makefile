@@ -1,6 +1,7 @@
 include ../Makefile.inc
 
 CFLAGS += -I$(CUAPI_INCLUDE_PATH) -I../include
+LDFLAGS += -pie
 TARGET := logger
 
 .PHONY: strip
