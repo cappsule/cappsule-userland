@@ -2,7 +2,7 @@
 
 This repository is part of [Cappsule](https://github.com/cappsule), and contains
 the userland part. Please refer to the
-[documentation](https://github.com/cappsule/doc/) for more information.
+[documentation](https://github.com/cappsule/cappsule-doc/) for more information.
 
 
 
@@ -17,5 +17,5 @@ the userland part. Please refer to the
 - `logger/`: `logger` binary
 - `snapshot/`: `snapshot` binary and cappsules initialization
 
-The [hypervisor repository](https://github.com/cappsule/hypervisor/) is required
-to build the project, because it contains header files.
+The [hypervisor repository](https://github.com/cappsule/cappsule-hypervisor/) is
+required to build the project, because it contains header files.
