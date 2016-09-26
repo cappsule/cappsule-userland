@@ -65,17 +65,17 @@ static int split_path(const char *path, struct relpath *relpath)
 	if (path[0] != '/')
 		return -1;
 
-	/* don't allow . and .. filename */
-	p = strrchr(path, '/');
-	if (strcmp(p + 1, ".") == 0 || strcmp(p + 1, "..") == 0)
-		return -1;
-
 	strncpy(relpath->buf, path, sizeof(relpath->buf));
 
 	/* remove trailing slashes */
 	p = relpath->buf + size - 1;
 	while (p > relpath->buf && *p == '/')
 		*p-- = '\x00';
+
+	/* don't allow . and .. filename */
+	p = strrchr(relpath->buf, '/');
+	if (strcmp(p + 1, ".") == 0 || strcmp(p + 1, "..") == 0)
+		return -1;
 
 	/* exception for "/": directory = "/" and filename = "." */
 	if (strcmp(relpath->buf, "/") == 0) {
