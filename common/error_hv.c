@@ -51,8 +51,7 @@ static char msg[128];
 	X(ERROR_CPU_VMX_DISABLED,		"VMX is disabled by BIOS")			\
 	X(ERROR_CPU_WB_MEMORY_TYPE,		"CPU doesn't support WB memory")		\
 	X(ERROR_CPU_NO_INVEPT,			"CPU doesn't support INVEPT instruction")	\
-	X(ERROR_CPU_INVEPT_SINGLE_CONTEXT,	"CPU doesn't support INVEPT single context")	\
-	X(ERROR_CPU_INVEPT_TYPE,		"CPU doesn't support INVEPT type")		\
+	X(ERROR_CPU_INVEPT_ALL_CONTEXT,		"CPU doesn't support all-context INVEPT type")	\
 	X(ERROR_CLEAR_TRUSTED_VMCS,		"failed to clear trusted vmcs")			\
 	X(ERROR_LOAD_TRUSTED_VMCS,		"failed to load trusted vmcs")			\
 	X(ERROR_CLEAR_CAPSULE_VMCS,		"failed to clear capsule vmcs")			\
